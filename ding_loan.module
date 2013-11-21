@@ -179,54 +179,19 @@ function ding_loan_loans_form($form, &$form_state, $account, $loans = array()) {
  * Submit handler for the form.
  */
 function ding_loan_loans_form_submit($form, &$form_state) {
+  global $user;
   $ids = array();
+  $not_renewed = array();
   foreach ($form_state['values']['items'] as $item) {
-    if ($item->renewable && $form_state['values'][$item->id]) {
-      $ids[] = $item->id;
+    if($form_state['values'][$item->id]) {
+      if ($item->renewable) {
+        $ids[] = $item->id;
+      } else {
+        $not_renewed[] = $item->id;
+      }
     }
   }
-
-  $clear_cache = FALSE;
-  if (!empty($ids)) {
-    $result = ding_provider_invoke('loan', 'renew', $form_state['values']['account'], $ids);
-    foreach ($result as $id => $loan_data) {
-      $loan = $loan_data['loan'];
-      if ($object = $form_state['values']['items'][$id]->entity) {
-        $title = $object->title;
-      }
-      else {
-        $title = $item->display_name;
-      }
-      // @todo Better feedback.
-      switch ($loan_data['status']) {
-        case DingProviderLoan::STATUS_RENEWED:
-          drupal_set_message(t('"@title renewed"', array('@title' => $title)));
-          $clear_cache = TRUE;
-          break;
-
-        case DingProviderLoan::STATUS_NOT_RENEWED:
-          if ($loan->message == 'maxNofRenewals') {
-            $message = t('Maximum number of renewals reached');
-          }
-          elseif ($loan->message == 'copyIsReserved') {
-            $message = t('The material is reserved by another loaner');
-          }
-          else {
-            $message = t('Unable to renew material');
-          }
-          drupal_set_message(t('"@title not renewed: @message"', array('@title' => $title, '@message' => $message)), 'warning');
-          break;
-
-        default:
-          watchdog('ding_loan', 'Unknown renewal status code @code.', array('@code' => $loan->message), WATCHDOG_ERROR);
-      }
-    }
-
-    // Clear session cache.
-    if ($clear_cache && module_exists('ding_session_cache')) {
-      ding_session_cache_clear('ding_loan', 'list');
-    }
-  }
+  ding_loan_handle_renew_loans($user, $ids, $not_renewed);
 }
 
 /**
@@ -283,4 +248,169 @@ function _ding_loan_loans_group_loans_by_date($loans) {
   }
 
   return $groups;
+}
+
+function ding_loan_handle_renew_loans($account, $renew, $not_renewed = array()) {
+  $clear_cache = FALSE;
+  $items = ding_provider_invoke_page('loan', 'list', $account);
+  $overdue = ding_provider_invoke_page('loan', 'overdue', $account);
+  if(count($not_renewed)) {
+    foreach($not_renewed as $key => $lid) {
+      $item = $items[$lid];
+      if ($object = $item->entity) {
+        $title = $object->getTitle();
+        $type = $object->getType();
+        ding_loan_adjust_title($title, $type, $item);
+        if($item->message != DingEntityBase::NULL) {
+          $message = t($item->message);
+          $title = ding_loan_set_message($title, $message);
+        } else {
+          $message = t('It was not possible to renew');
+          $title = ding_loan_set_message($title, $message);
+        }
+      }
+      else {
+        $title = ding_loan_get_remote_title($account, $item->ding_entity_id);
+        $message = t('It was not possible to renew');
+        $title = ding_loan_set_message($title, $message);
+      }
+      $not_renewed[$key] = $title;
+    }
+  }
+  
+  $result = ding_provider_invoke('loan', 'renew', $account, $renew);
+  $debts = ding_provider_invoke('debt', 'list', $account);
+  $renewed = array();
+  $fined = array();
+  $today = date('Y-m-d');
+  foreach ($result as $id => $state) {
+    $item = $items[$id];
+    $object = null;
+    if ($object = $item->entity) {
+      $title = $object->getTitle();
+      $type = $object->getType();
+      ding_loan_adjust_title($title, $type, $item);
+    }
+    else {
+      $title = ding_loan_get_remote_title($account, $item->ding_entity_id);
+    }
+    
+    // @todo Better feedback.
+    switch ($state['status']) {
+      case DingProviderLoan::STATUS_RENEWED:
+        $clear_cache = TRUE;
+        if(!$object) {
+          $title .= ' - ' . t('Fornyet med forbehold', array(), array('langcode' => 'da'));
+        }
+        $overdue_feed_today = false;
+        if(isset($overdue[$id])) {
+          foreach($debts as $did => $debt) {
+            list($alma_id, $debt_title) = explode('  ', $debt->note);
+            if($alma_id == $id && $debt->date == $today) {
+              $message = t('Renewed to late, fine @amount kr', array('@amount' => $debt->amount));
+              $title = ding_loan_set_message($title, $message);
+              $fined[$id] = $title;
+              $overdue_feed_today = true;
+            }
+          }
+        }
+        if(!$overdue_feed_today) {
+          $renewed[] = $title;
+        }
+        break;
+      case DingProviderLoan::STATUS_NOT_RENEWED:
+        $message = '';
+        if ($state['loan']->message == 'maxNofRenewals') {
+          $message = t('Maximum period reached');
+        } elseif ($state['loan']->message == 'copyIsReserved') {
+          $message = t('Reserved by another patron');
+        } else {
+          $message = t('It was not possible to renew');
+        }
+        $not_renewed[] = ding_loan_set_message($title, $message);
+        break;
+      default:
+        watchdog('ding_loan', 'Unknown renewal status code @code.', array('@code' => $state['loan']['message']), WATCHDOG_ERROR);
+    }
+  }
+  if(count($renewed)) {
+    $renewed_title = t('The following was renewed:', array(), array('langcode' => 'da'));
+    $renewed_list = theme('item_list', array('items' => $renewed, 'title' => $renewed_title));
+    drupal_set_message($renewed_list);
+  }
+  if(count($not_renewed)) {
+    $not_renewed_titel = t('The following could not be renewed:', array(), array('langcode' => 'da'));
+    $not_renewed_list = theme('item_list', array('items' => $not_renewed, 'title' => $not_renewed_titel));
+    drupal_set_message($not_renewed_list, 'warning');
+  }
+  
+  if(count($fined)) {
+    $fined_titel = t('The following materials had passed their return date') . ':';
+    $fined_list = theme('item_list', array('items' => array_values($fined), 'title' => $fined_titel));
+    drupal_set_message($fined_list, 'error');
+  }
+  // Clear session cache.
+  if ($clear_cache && module_exists('ding_session_cache')) {
+    ding_session_cache_clear('ding_loan', 'list');
+  }
+}
+
+function ding_loan_set_message($title, $message) {
+  if($message != '') {
+    $title .= ' - <strong>' . $message . '</strong>';
+  }
+  return $title;
+}
+
+function ding_loan_adjust_title(&$title, $type, $item) {
+  $object = $item->entity;
+  switch($type) {
+    case 'Billedbog':
+    case 'Bog':
+    case 'Bog stor skrift':
+    case 'Lydbog (cd-mp3)':
+    case 'Lydbog (cd)':
+    case 'Tegneserie':
+      $creators = implode(', ', $object->getCreators());
+      if($creators) {
+        $title .= ' : ' . $creators;
+      }
+      break;
+    case 'Blue-ray':
+    case 'Dvd':
+    case 'Video':
+      $publisher = $object->getPublisher();
+      if($publisher) {
+        $title .= ' : ' . $publisher;
+      }
+      break;
+    case 'Tidsskrift':
+    case 'Tidsskriftsartikel':
+      $notes = $item->getNotes();
+      if($notes) {
+        $title .= ' : ' . $notes;
+      }
+      break;
+    case 'Cd (musik)':
+    case 'Musik (net)':
+      $creators = implode(', ', $object->getCreators());
+      $creators = strlen($creators) > 30 ? substr($creators, 0, 30) . '...' : $creators;
+      if($creators) {
+        $title .= ' : ' . $creators;
+      }
+      break;
+  }
+}
+
+function ding_loan_get_remote_title($account, $ding_id) {
+  $split_id = explode(':', $ding_id);
+  $record_id = array_pop($split_id);
+  $data = alma_get_remote_data($account, $record_id);
+  if(isset($data['records'][$record_id])) {
+    $record = $data['records'][$record_id];
+    $title = $record['titles'][0];
+  } else {
+    $title = t('Unknown title');
+  }
+  return $title;
 }
